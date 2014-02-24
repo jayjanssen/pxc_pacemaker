@@ -21,41 +21,243 @@ use constant {
 	LOG_WARN => 3,
 	LOG_CRIT => 2,
 	LOG_FATAL => 1,
+	
+	# Cli tools
+	CRM_MASTER_CLI => "/usr/sbin/crm_master",
+	MYSQL_CLI => "/usr/bin/mysql",
+	SERVICE_MYSQL_CLI => "/sbin/service mysql",
+	
+	# Misc
+	START_TIMEOUT => 60,
+	
 };
 
 use vars qw { @ARGV %ENV $LOG_LEVEL };
 
-$LOG_LEVEL = 4;
+# Logging 
+# $LOG_LEVEL = LOG_DEBUG;
+$LOG_LEVEL = LOG_INFO;
 
 my $log = "/tmp/pxc_resource_agent.log";
 open( LOG, ">> $log" ) or die "Could not open logfile: $log\n";
 
 sub print_log {
-	my( $string ) = @_;
 	my $date = `date`; chop $date;
-	print LOG $date . " " . $string;
-	close( LOG );
+	print LOG $date . " " . join( ' ', @_ ) . "\n";
 }
 
 sub debug {
 	return if $LOG_LEVEL < LOG_DEBUG;
-	print_log( @_);
+	print_log( "DEBUG", @_);
 }
 sub info {
 	return if $LOG_LEVEL < LOG_INFO;
-	print_log( @_ );
+	print_log( "INFO", @_ );
+}
+sub warning {
+	return if $LOG_LEVEL < LOG_WARN;
+	print_log( "WARN", @_ );
+}
+sub error {
+	return if $LOG_LEVEL < LOG_ERROR;
+	print_log( "ERROR", @_ );
+}
+
+# Query mysql locally
+sub mysql_call {
+	my $cmd = MYSQL_CLI . ' --skip-column-names -Be "' . join( ' ', @_ ) . '"';
+	debug( "mysql call: $cmd" );
+	my $output = `$cmd`; chop $output;
+	my $rc = $?;
+	
+	debug( "mysql call rc: $rc");
+ 	die "Mysql call failed!" if $rc > 0;
+	
+	debug( "mysql call output: '$output'");
+	
+	return $output;
+}
+
+# call crm_master helper command
+sub crm_master_call {
+	my $cmd = CRM_MASTER_CLI . ' -l reboot ' . join( ' ', @_ );
+	debug( "crm master call: $cmd" );
+	my $output = `$cmd`; chop $output;
+	my $rc = $?;
+	
+	debug( "crm master call rc: $rc");
+ 	die "CRM master call failed!" if $rc > 0;
+	
+	debug( "CRM master call output: '$output'");
+	
+	return $output;
+}
+
+# check service status
+sub service_mysql_running {
+	my $cmd = SERVICE_MYSQL_CLI . " status";
+	info( "running: $cmd" );
+	system( $cmd );
+	my $rc = $? >> 8;
+	
+	info( "Mysql service rc: $rc" );
+	
+	if( $rc == 0 ) {
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+# issue service command
+sub service_mysql {
+	my $command = shift @_;
+	my $cmd = SERVICE_MYSQL_CLI . " " . $command;
+	info( "running: $cmd" );
+	system( $cmd );
+	my $rc = $? >> 8;
+	
+	info( "Mysql service rc: $rc" );
+	
+	if( $rc == 0 ) {
+		return 1;
+	} else {
+		return 0;
+	}
+}
+
+
+# OCF action handlers
+sub pxc_monitor {
+	
+	# Check local PXC instance
+	my $local_state;
+	eval {
+		$local_state = mysql_call( "select variable_value from information_schema.global_status where variable_name='wsrep_local_state_comment'" );
+	};
+	if( $@ ) {
+		# Check the service to see if it is running
+		warning( "monitor: $@" );
+ 		unless( service_mysql_running() ) {
+ 			return OCF_ERR_NOT_RUNNING;
+ 		} else {
+			return OCF_ERR_GENERIC;
+		}
+	} elsif( $local_state eq 'Synced' ) {
+		# This node can be promoted to "master"
+		info( "monitor results: master" );	
+		crm_master_call( "-v 100" );	
+		return OCF_RUNNING_MASTER;
+	} else {
+		info( "monitor results: slave" );
+		return OCF_SUCCESS;
+	}
+	# What are we monitoring?	
+}
+
+sub pxc_promote {
+	info( "promote action" );
+	my $state = pxc_monitor();
+	
+	if( $state == OCF_RUNNING_MASTER or $state == OCF_SUCCESS ) {
+		# Promote already done for us
+		crm_master_call( "-v 100" );
+		
+		return OCF_SUCCESS;
+	} else {
+		crm_master_call( "-D" );
+		return $state;
+	}
+}
+
+sub pxc_demote {
+	info( "demote action" );
+	my $state = pxc_monitor();
+	
+	if( $state == OCF_SUCCESS ) {
+		# demote already done for us
+		info( "Demote successfull" );
+		crm_master_call( "-D" );
+		return OCF_SUCCESS;
+	} elsif( $state == OCF_RUNNING_MASTER ) {
+		# We don't actually "demote" anybody
+		return OCF_SUCCESS;
+	} else {
+		# return $state;
+	}
+	
+	# should we ever NOT Return success?
+	return OCF_SUCCESS;
+}
+
+sub pxc_stop {
+	info( "stop action: noop" );
+	
+	return OCF_SUCCESS;
+}
+
+sub pxc_start {
+	info( "start action" );
+	
+	if( service_mysql_running() ) {
+		return OCF_SUCCESS;
+	} else {
+		my $rc = service_mysql( 'start' );
+		
+		unless( $rc ) {
+			error( "service mysql got rc: $rc" );
+			return OCF_ERR_GENERIC;
+		}
+		
+		# Wait a while for it to start:
+		my $timeout = START_TIMEOUT;
+		do {
+			info( "Waiting for mysql to start...");
+			sleep 1;
+			$timeout--;
+		} until( service_mysql_running() or $timeout <= 0 );
+		
+		if( service_mysql_running() ) {
+			return OCF_SUCCESS;
+		} else {
+			return OCF_ERR_NOT_RUNNING;
+		}
+	}	
 }
 
 # Main block
 eval {
 	my $command = $ARGV[0];
-	info( "Command: $command\n");
+	debug( "ARGV: " . Dumper( \@ARGV ));
 	debug( "ENV: " . Dumper( \%ENV ));
+	debug( "Command: $command");
+	
+	my $rc = OCF_SUCCESS;
+	if( $command eq 'monitor') {
+		$rc = pxc_monitor();
+		info( "monitor: $rc");
+	} elsif( $command eq 'promote') {
+		$rc = pxc_promote();
+		info( "promote: $rc");
+	} elsif( $command eq 'demote') {
+		$rc = pxc_demote();
+		info( "demote: $rc");
+	} elsif( $command eq 'start') {
+		$rc = pxc_start();
+		info( "start: $rc");
+	} elsif( $command eq 'stop') {
+		$rc = pxc_stop();
+		info( "stop: $rc");
+	}
+	
+	close( LOG );
+	exit $rc;
 	
 };
+
 if( $@ ) {
+	error( $@ );
+	close( LOG );
 	exit OFC_ERR_GENERIC;
-} else {
-	exit OCF_SUCCESS;
 }
 

@@ -42,7 +42,11 @@ use constant {
 
 use vars qw { @ARGV %ENV $LOG_LEVEL };
 
+
+#####
 # Logging 
+#####
+
 # $LOG_LEVEL = LOG_DEBUG;
 $LOG_LEVEL = LOG_INFO;
 
@@ -71,73 +75,77 @@ sub error {
 	print_log( "ERROR", @_ );
 }
 
-# Get a mysql global status variable (if mysql is running)
-sub mysql_global_status {
-	my $variable = shift @_;
-	my $cmd = MYSQL_CLI . ' --skip-column-names -Be "select variable_value from information_schema.global_status where variable_name=\'' . $variable . '\'"';
-	debug( "mysql global status: $cmd" );
+
+####
+# Utility functions
+####
+
+# Fork a system call and get a string for the output
+# $name: unique id for this command (for logging output)
+# $command: the command to run
+# $ok_rcs: return codes that should not through an exception (default: ['0'])
+sub unix_exec_string {
+	my( $name, $cmd, $acceptable_rcs ) = @_;
+	
+	$acceptable_rcs = [ 0 ] unless defined $acceptable_rcs;
+	
+	debug( "running $name: $cmd" );
 	my $output = `$cmd`; chop $output;
 	my $rc = $? >> 8;
 	
-	debug( "mysql global status rc: $rc");
- 	die "Mysql global status failed: $rc!\n" if $rc > 0;
-	
-	debug( "mysql global status output: '$output'");
+	debug( Dumper( $acceptable_rcs ));
+		
+	if( scalar grep {$_ == $rc} @$acceptable_rcs ) {
+		debug( "$name rc: $rc");
+		debug( "$name output: '$output'");
+	} else {
+	 	die "$name failed: $rc!\n";		
+	}
 	
 	return $output;
 }
 
-# call crm_master helper command
-sub crm_master_call {
-	my $cmd = CRM_MASTER_CLI . ' -l reboot ' . join( ' ', @_ );
-	debug( "crm master call: $cmd" );
-	my $output = `$cmd`; chop $output;
-	my $rc = $? >> 8;
-	
-	debug( "crm master call rc: $rc");
- 	die "CRM master call failed: $rc" if $rc > 0;
-	
-	debug( "CRM master call output: '$output'");
-	
-	return $output;
+sub unix_exec_ok {
+	eval{ unix_exec_string( @_ )};
+	return !$@;
+}
+
+# Get a mysql global status variable (if mysql is running)
+sub mysql_global_status {
+	my $variable = shift @_;
+	return unix_exec_string( 'mysql global status', 
+		MYSQL_CLI . ' --skip-column-names -Be "select variable_value from information_schema.global_status where variable_name=\'' . $variable . '\'"' 
+	);
+}
+
+# tell pacemaker this node may or may not be a master
+sub master_ok {
+	return unix_exec_string( 'crm master', CRM_MASTER_CLI . ' -l reboot -v 1' );
+}
+sub master_not_ok {
+	return unix_exec_string( 'crm master', CRM_MASTER_CLI . ' -l reboot -D' );
 }
 
 # Node-specific attributes
 sub crm_attr_set {
 	my( $name, $value ) = @_;
 
-	my $cmd = CRM_ATTR . " -l reboot --name $name-" . $ENV{'OCF_RESOURCE_INSTANCE'} . " -v $value";
-	debug( "crm attr call: $cmd" );
-	system( $cmd );
-	my $rc = $? >> 8;
-	
-	debug( "crm attr call rc: $rc");
-	return !$rc;	
+	return unix_exec_ok( 'crm attr set', 
+		CRM_ATTR . " -l reboot --name $name-" . $ENV{'OCF_RESOURCE_INSTANCE'} . " -v $value"
+	);
 }
 sub crm_attr_delete {
-	my( $name, $value ) = @_;
-
-	my $cmd = CRM_ATTR . " -l reboot --name $name-" . $ENV{'OCF_RESOURCE_INSTANCE'} . " --delete";
-	debug( "crm attr call: $cmd" );
-	system( $cmd );
-	my $rc = $? >> 8;
-	
-	debug( "crm attr call rc: $rc");
-	return !$rc;	
+	my( $name ) = @_;
+	return unix_exec_ok( 'crm attr delete', 
+		CRM_ATTR . " -l reboot --name $name-" . $ENV{'OCF_RESOURCE_INSTANCE'} . " --delete"
+	);
 }
 sub crm_attr_get {
 	my( $name ) = @_;
-
-	my $cmd = CRM_ATTR . " -l reboot --name $name-" . $ENV{'OCF_RESOURCE_INSTANCE'} . " --query -q";
-	debug( "crm attr get: $cmd" );
-	my $output = `$cmd`; chop $output;
-	my $rc = $? >> 8;
 	
-	debug( "crm attr get rc: $rc");
- 	die "CRM attr get failed: $rc!" if $rc > 0;
-	debug( "crm attr get output: $output");
-	
-	return $output;	
+	return unix_exec_string( 'crm attr get', 
+		CRM_ATTR . " -l reboot --name $name-" . $ENV{'OCF_RESOURCE_INSTANCE'} . " --query -q"
+	);
 }
 
 # Query CIB for all attributes for THIS resource
@@ -175,123 +183,87 @@ sub cib_query_attribute {
 
 # check service status
 sub service_mysql_running {
-	my $cmd = SERVICE_MYSQL_CLI . " status";
-	debug( "running: $cmd" );
-	system( $cmd );
-	my $rc = $? >> 8;
-	
-	debug( "Mysql service rc: $rc" );
-	
-	if( $rc == 0 ) {
-		return 1;
-	} else {
-		return 0;
-	}
+	return unix_exec_ok( 'service mysql status', SERVICE_MYSQL_CLI . ' status' );
 }
 
 # issue service command
 sub service_mysql {
 	my $command = shift @_;
-	my $cmd = SERVICE_MYSQL_CLI . " " . $command;
-	info( "running: $cmd" );
-	system( $cmd );
-	my $rc = $? >> 8;
-	
-	info( "Mysql service rc: $rc" );
-	
-	if( $rc == 0 ) {
-		return 1;
-	} else {
-		return 0;
-	}
+	return unix_exec_ok( "service mysql $command", 
+		SERVICE_MYSQL_CLI . ' ' . $command );
 }
 
 
+##### 
 # OCF action handlers
+#####
+
 sub pxc_monitor {
-	# Check local PXC instance
-	pxc_clear_gtid();
-		
-	my $local_state;
+	# Check local PXC instance		
+	my $local_state = undef;
+	my $rc = OCF_ERR_GENERIC;
 	eval {
 		$local_state = mysql_global_status( 'wsrep_local_state_comment' );
 	};
-	if( $@ ) {
-		crm_master_call( "-D" );
+	if( $@ or !defined( $local_state ) ) {
+		warning( "global status problem: $@" );
+		master_not_ok();
 		crm_attr_delete( 'pxc_running' );
 		
 		# Check the service to see if it is running
-		warning( "monitor: $@" );
- 		unless( service_mysql_running() ) {
-			# pxc_get_gtid() if( $ENV{'OCF_RESKEY_CRM_meta_clone'} == 0);
-			if( $ENV{'OCF_RESKEY_CRM_meta_role'} eq 'Master') {
-				return OCF_FAILED_MASTER;
-			} else {				
- 				return OCF_ERR_NOT_RUNNING;
-			}
+ 		if( !service_mysql_running() ) {
+			$rc = $ENV{'OCF_RESKEY_CRM_meta_role'} eq 'Master' ? 
+				OCF_FAILED_MASTER : OCF_ERR_NOT_RUNNING;
  		} else {
-			return OCF_ERR_GENERIC;
+			$rc = OCF_ERR_GENERIC;
 		}
-	} elsif( $local_state eq 'Synced' ) {
-		
-		# This node can be promoted to "master"
-		info( "monitor results: master" );	
-		crm_attr_set( 'pxc_running', "master" );
-		crm_master_call( "-v 1" );	
+	} elsif( $local_state eq 'Synced' ) {		
 		if( $ENV{'OCF_RESKEY_CRM_meta_role'} eq 'Master') {
-			return OCF_RUNNING_MASTER;			
+			debug( "already a master, normal" );	
+			crm_attr_set( 'pxc_running', "master" );
+			$rc = OCF_RUNNING_MASTER;			
 		} else {
-			return OCF_SUCCESS;
+			# This node can be promoted to "master"
+			debug( "not a master, but could be" );
+			master_ok();
+			$rc = OCF_SUCCESS;
 		}
 	} elsif( $local_state eq 'Donor/Desynced') {
-		info( "monitor results: slave" );
+		debug( "donor/desynced node" );
+		master_not_ok();
 		crm_attr_set( 'pxc_running', "slave" );
-		return OCF_SUCCESS;
-		
-	} else {
-		info( "monitor results: $local_state" );
-		return OCF_FAILED_MASTER;
+		$rc = OCF_SUCCESS;
 	}
+	
+	# Clear out the GTID every monitor just to be sure we never get a stale value
+	pxc_clear_gtid();
+	
+	if( $rc == OCF_SUCCESS or $rc == OCF_RUNNING_MASTER ) {
+		info( "monitor results: $local_state" );
+	} else {
+		error( "monitor results: $local_state" );
+	}
+	return $rc;
 }
 
-sub pxc_promote {
-	info( "promote action" );
+sub are_we_cool {
 	my $state = pxc_monitor();
-	
 	if( $state == OCF_RUNNING_MASTER or $state == OCF_SUCCESS ) {
 		# Promote already done for us
-		crm_master_call( "-v 100" );
-		
 		return OCF_SUCCESS;
 	} else {
-		crm_master_call( "-D" );
 		return $state;
 	}
 }
-
-sub pxc_demote {
-	info( "demote action" );
-	
-	crm_master_call( "-D" );
-	
-	my $state = pxc_monitor();
-	
-	if( $state == OCF_SUCCESS ) {
-		# demote already done for us
-		
-		info( "Demote successfull" );
-		return OCF_SUCCESS;
-	} elsif( $state == OCF_RUNNING_MASTER ) {
-		# We don't actually "demote" anybody
-		return OCF_SUCCESS;
-	} else {
-		# return $state;
-	}
-	
-	# should we ever NOT Return success?
-	return OCF_SUCCESS;
+sub pxc_promote {
+	debug( "promote action" );
+	return are_we_cool();
 }
 
+sub pxc_demote {
+	debug( "demote action" );
+	return are_we_cool();
+}
 
 sub pxc_start {
 	info( "start action" );
@@ -300,8 +272,6 @@ sub pxc_start {
 		info( "PXC already running" );
 		return OCF_SUCCESS;
 	} else {
-		# info( "ENV: " . Dumper( \%ENV ));
-
 		# Are there any other nodes in the cluster?
 		if( keys %{cib_query_attribute('pxc_running')} == 0 ) {
 			info( "No other nodes visibly running, trying bootstrap" );
@@ -353,12 +323,12 @@ sub pxc_bootstrap {
 	}	
 	
 	# 3b: need to sanity check the UUIDs here
+	# FIXME
 	
 	# Fourth, if the most ahead is US, then we bootstrap
-	my $hostname_cmd = HOSTNAME;
-	my $hostname = `$hostname_cmd`; chop $hostname;
+	my $hostname = unix_exec_string( 'get_hostname', HOSTNAME );
 	
-	info( "most ahead GTID: $most_ahead, us: $hostname");
+	info( "furthest ahead GTID: $most_ahead, us: $hostname");
 	if( $most_ahead eq $hostname ) {
 		info( "Bootstrapping PXC...");		
 		if( service_mysql( 'bootstrap-pxc' )) { 
@@ -383,53 +353,44 @@ sub pxc_get_gtid {
 	# return;
 	my ($uuid, $seqno) = (undef, undef);
 	
-	eval {	
-		# Start with running instance
-		if( service_mysql_running() ) {
-			 $uuid = mysql_global_status( 'wsrep_local_state_uuid' );
-			 $seqno = mysql_global_status( 'wsrep_last_committed' );
-		} else {
-			# If not running, check grastate
-			my $cmd = "cat " . GRASTATE;
-			debug( "get_gtid call: $cmd" );
-			my @output = `$cmd`;
-			my $rc = $?;
-	
-			if( $rc == 0 ) {
-				for my $line( @output ) {
-					if( $line =~ m/uuid:\s+(.+)/) {
-						$uuid = $1;
-					} elsif( $line =~ m/seqno:\s+(.+)/ ) {
-						$seqno = $1;
-					}
+	# Start with running instance
+	if( service_mysql_running() ) {
+		 $uuid = mysql_global_status( 'wsrep_local_state_uuid' );
+		 $seqno = mysql_global_status( 'wsrep_last_committed' );
+	} else {
+		# If not running, check grastate
+		eval {
+			my @output = split( /\n/, 
+				unix_exec_string( 'grastate', 'cat ' . GRASTATE )
+			);
+			for my $line( @output ) {
+				if( $line =~ m/uuid:\s+(.+)/) {
+					$uuid = $1;
+				} elsif( $line =~ m/seqno:\s+(.+)/ ) {
+					$seqno = $1;
 				}
 			}
-	
-			if( $seqno == -1 or !defined( $seqno )) {
-				# Lastly, try --wsrep_recover	
-				warning( "Trying --wsrep_recover" );
+		};
+		
+		if( $@ or $seqno == -1 or !defined( $seqno )) {
+			# Lastly, try --wsrep_recover	
+			warning( "Trying --wsrep_recover" );
+			eval {
+				my @output = split( /\n/, unix_exec_string( 
+					'wsrep_recover', 
+					MYSQLD_SAFE . ' --wsrep_recover' 
+				));
 			
-				my $cmd = MYSQLD_SAFE . " --wsrep_recover";
-				debug( "wsrep_recover: $cmd" );
-				my @output = `$cmd`;
-				my $rc = $? >> 8;
-	
-				debug( "crm attr get rc: $rc");
-				die "--wsrep_recover failed: $rc" if $rc > 0;
-				
 				foreach my $line( @output ) {
 					if( $line =~ m/Recovered position ([\w\-]+)\:([\-\d]+)/ ) {
 						$uuid = $1; $seqno = $2;
-						
-						info( "recovered gtid: $uuid:$seqno");
 					} else {
 						debug( "NO MATCH: " . $line );
 					}
 				}
-			
-			}
+			};
 		}
-	};
+	}
 	
 	if( $@ or ( !defined( $uuid ) or !defined( $seqno ))) {
 		error( "Could not get local GTID: $@" );
@@ -441,8 +402,6 @@ sub pxc_get_gtid {
 
 		crm_attr_set( 'pxc_uuid', $uuid );
 		crm_attr_set( 'pxc_seqno', $seqno );
-		
-		crm_master_call( "-v $seqno" );	
 	}
 }
 
@@ -473,13 +432,11 @@ eval {
 		$rc = pxc_demote();
 	} elsif( $command eq 'start') {
 		$rc = pxc_start();
-	} elsif( $command eq 'notify') {
-		$rc = pxc_notify();
 	} else {
 		info( "$command: noop");
 	}
 	
-	info( "$command: $rc" );
+	debug( "$command: $rc" );
 	
 	close( LOG );
 	exit $rc;
@@ -491,4 +448,3 @@ if( $@ ) {
 	close( LOG );
 	exit OFC_ERR_GENERIC;
 }
-

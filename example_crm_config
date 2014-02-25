@@ -1,0 +1,20 @@
+node node1 \
+        attributes standby="off" maintenance="off"
+node node2 \
+        attributes standby="off"
+node node3 \
+        attributes standby="off"
+primitive p_pxc ocf:percona:pxc_resource_agent \
+        op monitor interval="5s" role="Master" \
+        op monitor interval="2s" role="Slave" \
+        op start timeout="300s" interval="0"
+ms ms_pxc p_pxc \
+        meta master-max="3" clone-max="3" target-role="Master" is-managed="true" ordered="false" interleave="true" notify="false"
+property $id="cib-bootstrap-options" \
+        dc-version="1.1.10-14.el6_5.2-368c726" \
+        cluster-infrastructure="classic openais (with plugin)" \
+        expected-quorum-votes="3" \
+        stonith-enabled="false" \
+        no-quorum-policy="freeze" \
+        last-lrm-refresh="1393355403"
+

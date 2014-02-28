@@ -407,7 +407,7 @@ sub pxc_start {
 				return OCF_ERR_UNIMPLEMENTED;
 			}
 		} else {
-			info( "Other nodes report running, skip bootstrap" );
+			info( "Other nodes report running, starting..." );
 			
 			service_mysql( 'stop' ); # clean out any pid files
 			if( service_mysql( 'start' )) {	

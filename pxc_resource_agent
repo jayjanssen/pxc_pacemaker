@@ -1,6 +1,8 @@
 #!/usr/bin/perl
 
+# Endeavoring here to only use modules included in the base perl package on the major distros
 use Data::Dumper;
+use Scalar::Util qw/ looks_like_number /;
 
 use constant {
 	# Pacemaker RA standard exit codes
@@ -34,15 +36,12 @@ use constant {
 	
 	# Grastate path
 	GRASTATE => "grastate.dat",
-	
-	# Misc settings
-	BOOTSTRAP_TIMEOUT => 60,
 };
 
 my %defaults = (
 	'OCF_RESKEY_datadir' => '/var/lib/mysql',
 	'OCF_RESKEY_enable_bootstrap' => 0,
-	'OCF_RESKEY_bootstrap_timeout' => BOOTSTRAP_TIMEOUT,
+	'OCF_RESKEY_bootstrap_timeout' => 120,
 );
 
 sub load_defaults {
@@ -106,7 +105,6 @@ sub unix_exec_string {
 	my $output = `$cmd`; chop $output;
 	my $rc = $? >> 8;
 	
-	debug( "HERE" );
 	debug( Dumper( $acceptable_rcs ));
 		
 	if( scalar grep {$_ == $rc} @$acceptable_rcs ) {
@@ -287,16 +285,15 @@ END
 
 
 sub pxc_validate {
-	info( "validate" );
+	# Check that all the executables I expect are in the the PATH
 	my $rc = OCF_SUCCESS;
 	foreach my $binary ( CRM_MASTER_CLI, CRM_ATTR, CRM_NODE, CIBADMIN, MYSQL_CLI, SERVICE_CLI, MYSQLD_SAFE ) {
-		if( unix_exec_ok( 'test_binary', "which $binary")) {
+		unless( unix_exec_ok( 'test_binary', "which $binary")) {
 			error( "Could not find $binary in PATH" );
 			$rc = OCF_ERR_INSTALLED;
 		}
 	}
 	return $rc unless $rc == OCF_SUCCESS;
-	
 	
 	# $OCF_SUCCESS — all is well, the configuration is valid and usable.
 	# $OCF_ERR_CONFIGURED — the user has misconfigured the resource.
@@ -305,20 +302,22 @@ sub pxc_validate {
 	
 	# Check RA options ok
 	return OCF_ERR_CONFIGURED unless -d $ENV{'OCF_RESKEY_datadir'};
-	unless( $ENV{'OCF_RESKEY_enable_bootstrap'} <= 1 and 
-			$ENV{'OCF_RESKEY_enable_bootstrap'} >= 0 ) 
+	unless( looks_like_number( $ENV{'OCF_RESKEY_enable_bootstrap'} ) and 
+		($ENV{'OCF_RESKEY_enable_bootstrap'} == 0 or $ENV{'OCF_RESKEY_enable_bootstrap'} == 1 )) 
 	{
 		# FIXME Emitting this throws an error, but it doesn't display properly 
-		print STDERR "ERROR: Bootstrap must be 1 or 0\n";
+		error( "enable_bootstrap must be 1 or 0" );
 		return OCF_ERR_CONFIGURED;		
 	}
 	
-	if( $ENV{'OCF_RESKEY_bootstrap_timeout'} < 0 ) {
-		print STDERR "ERROR: Bootstrap timeout is not a positive number\n";
+	unless( looks_like_number( $ENV{'OCF_RESKEY_bootstrap_timeout'} ) and
+		$ENV{'OCF_RESKEY_bootstrap_timeout'} > 0 ) 
+	{
+		error( "bootstrap_timeout is not a positive number" );
 		return OCF_ERR_CONFIGURED;
 	}
 	
-	return $rc;
+	return OCF_SUCCESS;
 }
 
 sub pxc_monitor {
@@ -554,25 +553,36 @@ eval {
 	
 	load_defaults();
 	
-	debug( "ARGV: " . Dumper( \@ARGV ));
-	debug( "ENV: " . Dumper( \%ENV ));
-	debug( "Command: $command");
-	
+	# Only validate on specific actions since validation is heavy
 	my $rc = OCF_SUCCESS;
-	if( $command eq 'monitor') {
-		$rc = pxc_monitor();
-	} elsif( $command eq 'promote') {
-		$rc = pxc_promote();
-	} elsif( $command eq 'demote') {
-		$rc = pxc_demote();
-	} elsif( $command eq 'start') {
-		$rc = pxc_start();
-	} elsif( $command eq 'validate-all') {
+	if( $command eq 'start' or $command eq 'promote' or $command eq 'stop' or $command eq 'demote' ) {
 		$rc = pxc_validate();
-	} elsif( $command eq 'meta-data') {
-		$rc = pxc_meta();
+	}
+	
+	# my $rc = OCF_SUCCESS;
+	unless( $rc == OCF_SUCCESS ) {
+		# Validate error
+		error( "Validation failed, check your configuration" );
 	} else {
-		info( "$command: noop");
+		debug( "ARGV: " . Dumper( \@ARGV ));
+		debug( "ENV: " . Dumper( \%ENV ));
+		debug( "Command: $command");
+	
+		if( $command eq 'monitor') {
+			$rc = pxc_monitor();
+		} elsif( $command eq 'promote') {
+			$rc = pxc_promote();
+		} elsif( $command eq 'demote') {
+			$rc = pxc_demote();
+		} elsif( $command eq 'start') {
+			$rc = pxc_start();
+		} elsif( $command eq 'validate-all') {
+			$rc = pxc_validate();
+		} elsif( $command eq 'meta-data') {
+			$rc = pxc_meta();
+		} else {
+			info( "$command: noop");
+		}
 	}
 	
 	debug( "$command: $rc" );

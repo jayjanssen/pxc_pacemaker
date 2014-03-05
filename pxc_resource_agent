@@ -282,20 +282,20 @@ When bootstrapping, wait at least this long to ensure all posssible members have
 
 END
 
-	return OFC_SUCCESS;
+	return OCF_SUCCESS;
 }
 
 
 sub pxc_validate {
 	info( "validate" );
-	my $rc = OFC_SUCCESS;
+	my $rc = OCF_SUCCESS;
 	foreach my $binary ( CRM_MASTER_CLI, CRM_ATTR, CRM_NODE, CIBADMIN, MYSQL_CLI, SERVICE_CLI, MYSQLD_SAFE ) {
 		if( unix_exec_ok( 'test_binary', "which $binary")) {
 			error( "Could not find $binary in PATH" );
 			$rc = OCF_ERR_INSTALLED;
 		}
 	}
-	return $rc unless $rc == OFC_SUCCESS;
+	return $rc unless $rc == OCF_SUCCESS;
 	
 	
 	# $OCF_SUCCESS — all is well, the configuration is valid and usable.
@@ -585,5 +585,5 @@ eval {
 if( $@ ) {
 	error( $@ );
 	close( LOG );
-	exit OFC_ERR_GENERIC;
+	exit OCF_ERR_GENERIC;
 }

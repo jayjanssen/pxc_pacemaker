@@ -1,3 +1,6 @@
 [submodule "vagrant-percona"]
 	path = vagrant-percona
 	url = git@github.com:jayjanssen/vagrant-percona.git
+[submodule "percona-pacemaker-agents"]
+	path = percona-pacemaker-agents
+	url = git@github.com:percona/percona-pacemaker-agents.git
